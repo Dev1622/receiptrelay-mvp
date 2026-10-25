@@ -172,7 +172,8 @@ const starter = {
 function loadData() {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    return saved ? JSON.parse(saved) : starter;
+    const parsed = saved ? JSON.parse(saved) : starter;
+    return { ...parsed, clients: (parsed.clients || []).map(c => ({ ...c, phone: c.phone || "", items: c.items || [] })) };
   } catch {
     return starter;
   }
@@ -184,12 +185,15 @@ function App() {
   const [selectedId, setSelectedId] = useState(() => loadData().clients[0]?.id || "");
   const [query, setQuery] = useState("");
   const [showAddClient, setShowAddClient] = useState(false);
-  const [newClient, setNewClient] = useState({ name: "", email: "", period: "October 2026", deadline: "" });
+  const [editingId, setEditingId] = useState("");
+  const [newClient, setNewClient] = useState({ name: "", email: "", phone: "", period: "October 2026", deadline: "" });
   const [newItem, setNewItem] = useState("");
   const [channel, setChannel] = useState("Email");
   const [tone, setTone] = useState("Friendly");
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState("");
+  const [dashboardFilter, setDashboardFilter] = useState("All Clients");
+  const [selectedBulk, setSelectedBulk] = useState([]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
@@ -200,8 +204,16 @@ function App() {
 
   const client = data.clients.find(c => c.id === selectedId) || null;
   const filteredClients = data.clients.filter(c =>
-    `${c.name} ${c.email}`.toLowerCase().includes(query.toLowerCase())
+    `${c.name} ${c.email} ${c.phone || ""}`.toLowerCase().includes(query.toLowerCase())
   );
+  const localToday = (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; })();
+  const clientStatus = c => {
+    const pending = c.items.filter(i => !i.received).length;
+    if (!pending) return "Complete";
+    if (c.deadline && c.deadline < localToday) return "Overdue";
+    return "Needs Follow-up";
+  };
+  const dashboardClients = data.clients.filter(c => dashboardFilter === "All Clients" || (dashboardFilter === "Missing Documents" ? c.items.some(i => !i.received) : dashboardFilter === "Overdue" ? clientStatus(c) === "Overdue" : clientStatus(c) === "Complete"));
   const outstanding = client?.items.filter(i => !i.received) || [];
   const receivedCount = client?.items.filter(i => i.received).length || 0;
   const totalItems = client?.items.length || 0;
@@ -227,19 +239,45 @@ function App() {
   function addClient(e) {
     e.preventDefault();
     if (!newClient.name.trim()) return;
+    if (editingId) {
+      updateClient(editingId, c => ({ ...c, ...newClient, name: newClient.name.trim(), email: newClient.email.trim(), phone: newClient.phone.trim() }));
+      setSelectedId(editingId); setEditingId(""); setShowAddClient(false); setNotice("Client updated"); return;
+    }
     const c = {
       id: crypto.randomUUID(),
       name: newClient.name.trim(),
       email: newClient.email.trim(),
+      phone: newClient.phone.trim(),
       period: newClient.period.trim() || "Current period",
       deadline: newClient.deadline,
       items: []
     };
     setData(prev => ({ ...prev, clients: [c, ...prev.clients] }));
     setSelectedId(c.id);
-    setNewClient({ name: "", email: "", period: "October 2026", deadline: "" });
+    setNewClient({ name: "", email: "", phone: "", period: "October 2026", deadline: "" });
     setShowAddClient(false);
     setNotice("Client added");
+  }
+
+  function openEditClient(c) { setEditingId(c.id); setNewClient({ name:c.name, email:c.email || "", phone:c.phone || "", period:c.period || "", deadline:c.deadline || "" }); setShowAddClient(true); }
+  function whatsappUrl(c, message) {
+    const phone = (c.phone || "").replace(/[^\d]/g, "");
+    if (!phone) { setNotice("Add a WhatsApp number with country code to this client first."); return null; }
+    if (phone.length < 7 || phone.length > 15) { setNotice("Enter a valid international number, including country code."); return null; }
+    return `https://wa.me/${phone}?text=${encodeURIComponent(message)}`;
+  }
+  function sendWhatsApp(c, message) { const url = whatsappUrl(c, message); if (url) window.open(url, "_blank", "noopener,noreferrer"); }
+  async function prepareBulkDrafts() {
+    const chosen = dashboardClients.filter(c => selectedBulk.includes(c.id));
+    if (!chosen.length) { setNotice("Select one or more clients to prepare drafts."); return; }
+    const drafts = chosen.map(c => {
+      const missing = c.items.filter(i => !i.received);
+      const list = missing.length ? missing.map(i => `• ${i.name}`).join("\n") : "Everything on the checklist is marked received.";
+      const date = c.deadline ? ` Please send these by ${new Date(`${c.deadline}T12:00:00`).toLocaleDateString(undefined, {month:"short",day:"numeric",year:"numeric"})}.` : "";
+      return `To: ${c.name}${c.phone ? ` (${c.phone})` : c.email ? ` (${c.email})` : ""}\nHi ${c.name} team,\nA quick follow-up for ${c.period || "this period"}. Could you please share:\n\n${list}${date}\n\nThanks!`;
+    }).join("\n\n────────────────────\n\n");
+    try { await navigator.clipboard.writeText(drafts); setNotice(`${chosen.length} reminder draft(s) copied. Review each draft before sending.`); }
+    catch { setNotice("Clipboard access was blocked. Allow clipboard access and try again."); }
   }
 
   function addItem(e) {
@@ -325,6 +363,13 @@ function App() {
           </div>
         </section>
 
+        <section className="panel dashboard-panel">
+          <div className="panel-heading"><div><span className="section-kicker">PORTFOLIO</span><h2>All Clients</h2></div><button className="btn btn-primary" onClick={prepareBulkDrafts}><Copy size={15}/> Prepare Reminder Drafts</button></div>
+          <div className="dashboard-summary">{[['Total clients',data.clients.length],['Missing documents',data.clients.filter(c=>c.items.some(i=>!i.received)).length],['Overdue clients',data.clients.filter(c=>clientStatus(c)==='Overdue').length],['Completed clients',data.clients.filter(c=>clientStatus(c)==='Complete').length]].map(([label,count])=><div className="stat-card" key={label}><span className="stat-label">{label}</span><strong>{count}</strong></div>)}</div>
+          <div className="dashboard-filters">{['All Clients','Missing Documents','Overdue','Complete'].map(f=><button key={f} className={`filter-chip ${dashboardFilter===f?'active':''}`} onClick={()=>setDashboardFilter(f)}>{f}</button>)}</div>
+          <div className="table-scroll"><table className="client-table"><thead><tr><th><input type="checkbox" aria-label="Select all visible clients" checked={dashboardClients.length>0&&dashboardClients.every(c=>selectedBulk.includes(c.id))} onChange={e=>setSelectedBulk(e.target.checked?[...new Set([...selectedBulk,...dashboardClients.map(c=>c.id)])]:selectedBulk.filter(id=>!dashboardClients.some(c=>c.id===id)))}/></th><th>Client / business</th><th>Email / WhatsApp</th><th>Outstanding</th><th>Received</th><th>Target date</th><th>Status</th><th>Actions</th></tr></thead><tbody>{dashboardClients.map(c=>{const pending=c.items.filter(i=>!i.received).length,status=clientStatus(c),msg=`Hi ${c.name} team, a quick follow-up for ${c.period||'this period'}. Could you please share:\n\n${c.items.filter(i=>!i.received).map(i=>`• ${i.name}`).join('\n')||'Everything on the checklist is marked received.'}${c.deadline?`\n\nPlease send these by ${c.deadline}.`:''}`;return <tr key={c.id}><td><input type="checkbox" aria-label={`Select ${c.name}`} checked={selectedBulk.includes(c.id)} onChange={e=>setSelectedBulk(e.target.checked?[...selectedBulk,c.id]:selectedBulk.filter(id=>id!==c.id))}/></td><td><button className="table-client" onClick={()=>{setSelectedId(c.id);document.querySelector('.workspace')?.scrollIntoView({behavior:'smooth'});}}>{c.name}</button></td><td>{c.email||c.phone||'—'}</td><td>{pending}</td><td>{c.items.length-pending}</td><td>{c.deadline?new Date(`${c.deadline}T12:00:00`).toLocaleDateString():'—'}</td><td><span className={`table-status ${status==='Complete'?'done':status==='Overdue'?'late':'pending'}`}>{status}</span></td><td><div className="table-actions"><button className="btn btn-quiet" onClick={()=>{setSelectedId(c.id);document.querySelector('.workspace')?.scrollIntoView({behavior:'smooth'});}}>Open Client</button><button className="btn btn-quiet" onClick={()=>sendWhatsApp(c,msg)}>WhatsApp</button></div></td></tr>})}{!dashboardClients.length&&<tr><td colSpan="8" className="table-empty">No clients match this filter yet.</td></tr>}</tbody></table></div>
+        </section>
+
         <div className="workspace">
           <aside className="sidebar panel">
             <div className="side-heading">
@@ -362,7 +407,7 @@ function App() {
                       <span className="avatar avatar-large">{client.name.split(/\s+/).slice(0, 2).map(w => w[0]).join("").toUpperCase()}</span>
                       <div><span className="section-kicker">CLIENT OVERVIEW</span><h2>{client.name}</h2><p>{client.email || "No email added"} <span className="separator">·</span> {client.period}</p></div>
                     </div>
-                    <button className="icon-btn danger-icon" title="Delete client" aria-label="Delete client" onClick={deleteClient}><Trash2 size={17}/></button>
+                    <div className="table-actions"><button className="icon-btn" title="Edit client" aria-label="Edit client" onClick={()=>openEditClient(client)}>✎</button><button className="icon-btn danger-icon" title="Delete client" aria-label="Delete client" onClick={deleteClient}><Trash2 size={17}/></button></div>
                   </div>
                   <div className="progress-head"><span>Document checklist</span><strong>{receivedCount} of {totalItems} received</strong></div>
                   <div className="progress-track"><span style={{width: `${totalItems ? receivedCount / totalItems * 100 : 0}%`}} /></div>
@@ -399,7 +444,7 @@ function App() {
                     <label>Tone<select value={tone} onChange={e => setTone(e.target.value)}><option>Friendly</option><option>Direct</option></select></label>
                   </div>
                   <div className="message-preview"><div className="preview-label"><span className="preview-dot"/> MESSAGE PREVIEW</div><pre>{reminder}</pre></div>
-                  <div className="reminder-footer"><span>Review the draft before sending.</span><button className="btn btn-primary" onClick={copyReminder}>{copied ? <CheckCheck size={16}/> : <Copy size={16}/>} {copied ? "Copied!" : "Copy reminder"}</button></div>
+                  <div className="reminder-footer"><span>Review the draft before sending.</span><div className="table-actions"><button className="btn btn-quiet" onClick={copyReminder}>{copied ? <CheckCheck size={16}/> : <Copy size={16}/>} {copied ? "Copied!" : "Copy reminder"}</button><button className="btn btn-primary" onClick={()=>sendWhatsApp(client, reminder.replace(/^Subject:.*\n\n/,""))}><Send size={15}/> Send via WhatsApp</button></div></div>
                 </section>
               </>
             )}
@@ -408,13 +453,14 @@ function App() {
         <footer className="footer"><span>ReceiptRelay <span className="footer-dot">·</span> Early MVP</span><span>Demo data is stored in this browser only.</span></footer>
       </main>
 
-      {showAddClient && <div className="modal-backdrop" role="presentation" onMouseDown={e => {if(e.target === e.currentTarget) setShowAddClient(false);}}>
+      {showAddClient && <div className="modal-backdrop" role="presentation" onMouseDown={e => {if(e.target === e.currentTarget) {setShowAddClient(false);setEditingId("");}}}>
         <form className="modal" onSubmit={addClient}>
-          <div className="modal-head"><div><span className="section-kicker">NEW RECORD</span><h2>Add a client</h2></div><button type="button" className="icon-btn" onClick={() => setShowAddClient(false)} aria-label="Close"><X size={18}/></button></div>
+          <div className="modal-head"><div><span className="section-kicker">{editingId?"UPDATE RECORD":"NEW RECORD"}</span><h2>{editingId?"Edit client":"Add a client"}</h2></div><button type="button" className="icon-btn" onClick={() => {setShowAddClient(false);setEditingId("");}} aria-label="Close"><X size={18}/></button></div>
           <label>Client or business name *<input autoFocus required value={newClient.name} onChange={e => setNewClient({...newClient, name: e.target.value})} placeholder="e.g. Acme Studio"/></label>
           <label>Contact email (optional)<input type="email" value={newClient.email} onChange={e => setNewClient({...newClient, email: e.target.value})} placeholder="accounts@company.com"/></label>
+          <label>WhatsApp phone number (optional)<input type="tel" value={newClient.phone} onChange={e => setNewClient({...newClient, phone: e.target.value})} placeholder="+1 555 123 4567"/><small>Include country code for WhatsApp click-to-chat.</small></label>
           <div className="modal-grid"><label>Period<input value={newClient.period} onChange={e => setNewClient({...newClient, period: e.target.value})} placeholder="October 2026"/></label><label>Target date<input type="date" value={newClient.deadline} onChange={e => setNewClient({...newClient, deadline: e.target.value})}/></label></div>
-          <div className="modal-actions"><button type="button" className="btn btn-quiet" onClick={() => setShowAddClient(false)}>Cancel</button><button type="submit" className="btn btn-primary"><Plus size={16}/> Create client</button></div>
+          <div className="modal-actions"><button type="button" className="btn btn-quiet" onClick={() => {setShowAddClient(false);setEditingId("");}}>Cancel</button><button type="submit" className="btn btn-primary"><Plus size={16}/> {editingId?"Save changes":"Create client"}</button></div>
         </form>
       </div>}
       {notice && <div className="toast" role="status">{notice}<button onClick={() => setNotice("")} aria-label="Dismiss"><X size={14}/></button></div>}
