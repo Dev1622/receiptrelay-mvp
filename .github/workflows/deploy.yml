@@ -3,7 +3,7 @@ name: Deploy ReceiptRelay
 
 on:
   push:
-    branches: [main]
+    branches: [receiptrelay-mvp/V3]
   workflow_dispatch:
 
 permissions:
