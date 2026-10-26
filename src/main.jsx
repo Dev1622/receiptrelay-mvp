@@ -172,7 +172,8 @@ const starter = {
 function loadData() {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    return saved ? JSON.parse(saved) : starter;
+    const parsed = saved ? JSON.parse(saved) : starter;
+    return { ...parsed, clients: (parsed.clients || []).map(c => ({ ...c, phone: c.phone || "", items: c.items || [] })) };
   } catch {
     return starter;
   }
@@ -184,10 +185,14 @@ function App() {
   const [selectedId, setSelectedId] = useState(() => loadData().clients[0]?.id || "");
   const [query, setQuery] = useState("");
   const [showAddClient, setShowAddClient] = useState(false);
-  const [newClient, setNewClient] = useState({ name: "", email: "", period: "October 2026", deadline: "" });
+  const [editingClientId, setEditingClientId] = useState("");
+  const [newClient, setNewClient] = useState({ name: "", email: "", phone: "", period: "October 2026", deadline: "" });
   const [newItem, setNewItem] = useState("");
   const [channel, setChannel] = useState("Email");
-  const [tone, setTone] = useState("Friendly");
+  const [tone, setTone] = useState("Friendly and professional");
+  const [customTone, setCustomTone] = useState("");
+  const [instructions, setInstructions] = useState("Mention the missing documents and ask the client to send them before the deadline.");
+  const [drafts, setDrafts] = useState({});
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState("");
 
@@ -209,16 +214,45 @@ function App() {
 
   const reminder = useMemo(() => {
     if (!client) return "";
-    const greeting = client.name.trim() ? `Hi ${client.name.trim()} team,` : "Hello,";
+    const greeting = client.name.trim() ? `Hi ${client.name.trim()},` : "Hello,";
     const list = outstanding.length
       ? outstanding.map(i => `• ${i.name}`).join("\n")
       : "Everything on our checklist has been marked as received.";
     const friendly = `Just a quick follow-up for ${client.period || "this period"}. Could you please share the following items when you get a chance?\n\n${list}\n\n${client.deadline ? `If possible, please send these by ${new Date(`${client.deadline}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}. ` : ""}Let me know if anything is unclear. Thanks!`;
     const direct = `We're preparing the books for ${client.period || "the current period"} and still need the items below:\n\n${list}\n\n${client.deadline ? `Please send them by ${new Date(`${client.deadline}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })} so we can keep the close on schedule. ` : ""}Please reply if an item isn't available. Thank you.`;
-    const body = tone === "Direct" ? direct : friendly;
+    const body = tone === "Short and direct" || tone === "Polite but firm" ? direct : friendly;
     if (channel === "WhatsApp") return `${greeting}\n${body}`;
     return `Subject: Missing documents for ${client.period || "month-end"}\n\n${greeting}\n\n${body}`;
   }, [client, outstanding, channel, tone]);
+
+  const activeDraft = client ? (drafts[client.id]?.text ?? reminder) : "";
+  const hasGeneratedDraft = Boolean(client && drafts[client.id]);
+
+  function generateDraft() {
+    if (!client) return;
+    if (drafts[client.id]?.edited && !window.confirm("Replace your edited draft with a new demo draft? Your current draft will be replaced.")) return;
+    const missing = client.items.filter(i => !i.received);
+    const date = client.deadline ? new Date(`${client.deadline}T12:00:00`).toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" }) : "";
+    let body;
+    if (!missing.length) {
+      body = `Hi ${client.name || "there"},\n\nThere are no outstanding documents on the ${client.period || "current period"} checklist. Thank you!`;
+    } else {
+      const names = missing.map(i => i.name).join(", ");
+      const guidance = `${instructions} ${tone === "Custom instructions" ? customTone : ""}`.toLowerCase();
+      const concise = tone === "Short and direct" || /short|brief|concise/.test(guidance);
+      const firm = tone === "Polite but firm" || /firm|urgent|promptly/.test(guidance);
+      const intro = concise ? `We still need ${names}. Please send them${date ? ` by ${date}` : " as soon as possible"}.` : firm ? `We are still waiting for ${names}. Please send them${date ? ` by ${date}` : " as soon as possible"} so we can complete the records.` : `I hope you're doing well. We're still waiting for ${names}. Could you please send them${date ? ` before ${date}` : " when you can"} so we can complete the records?`;
+      body = `Hi ${client.name || "there"},\n\n${intro}\n\nThank you!`;
+    }
+    const text = channel === "Email" ? `Subject: Missing documents for ${client.period || "this period"}\n\n${body}` : body;
+    setDrafts(prev => ({ ...prev, [client.id]: { text, edited: false } }));
+    setNotice("Demo draft generated. Review it before sending.");
+  }
+
+  function updateDraft(text) {
+    if (!client) return;
+    setDrafts(prev => ({ ...prev, [client.id]: { text, edited: true } }));
+  }
 
   function updateClient(id, updater) {
     setData(prev => ({ ...prev, clients: prev.clients.map(c => c.id === id ? updater(c) : c) }));
@@ -227,17 +261,22 @@ function App() {
   function addClient(e) {
     e.preventDefault();
     if (!newClient.name.trim()) return;
+    if (editingClientId) {
+      setData(prev => ({ ...prev, clients: prev.clients.map(c => c.id === editingClientId ? { ...c, ...newClient, name: newClient.name.trim(), email: newClient.email.trim(), phone: newClient.phone.trim() } : c) }));
+      setShowAddClient(false); setEditingClientId(""); setNotice("Client details updated"); return;
+    }
     const c = {
       id: crypto.randomUUID(),
       name: newClient.name.trim(),
       email: newClient.email.trim(),
+      phone: newClient.phone.trim(),
       period: newClient.period.trim() || "Current period",
       deadline: newClient.deadline,
       items: []
     };
     setData(prev => ({ ...prev, clients: [c, ...prev.clients] }));
     setSelectedId(c.id);
-    setNewClient({ name: "", email: "", period: "October 2026", deadline: "" });
+    setNewClient({ name: "", email: "", phone: "", period: "October 2026", deadline: "" });
     setShowAddClient(false);
     setNotice("Client added");
   }
@@ -267,13 +306,28 @@ function App() {
 
   async function copyReminder() {
     try {
-      await navigator.clipboard.writeText(reminder);
+      await navigator.clipboard.writeText(activeDraft);
       setCopied(true);
       setNotice("Reminder copied to clipboard");
       setTimeout(() => setCopied(false), 1800);
     } catch {
       setNotice("Clipboard access was blocked. Select and copy the reminder text manually.");
     }
+  }
+
+  function openWhatsApp() {
+    if (!client?.phone?.trim()) { setNotice("Add a WhatsApp number with country code when creating this client."); return; }
+    const phone = client.phone.replace(/[^\d]/g, "");
+    if (phone.length < 7 || phone.length > 15) { setNotice("Enter a valid international WhatsApp number, including country code."); return; }
+    const message = activeDraft.replace(/^Subject:[^\n]*\n\n/, "");
+    window.open(`https://wa.me/${phone}?text=${encodeURIComponent(message)}`, "_blank", "noopener,noreferrer");
+  }
+
+  function editClientDetails() {
+    if (!client) return;
+    setEditingClientId(client.id);
+    setNewClient({ name: client.name, email: client.email || "", phone: client.phone || "", period: client.period || "", deadline: client.deadline || "" });
+    setShowAddClient(true);
   }
 
   function exportCsv() {
@@ -306,7 +360,7 @@ function App() {
           <span>Receipt<span className="brand-light">Relay</span></span>
         </a>
         <div className="top-actions">
-          <button className="btn btn-quiet" onClick={() => { setView("landing"); window.scrollTo({ top: 0, behavior: "smooth" }); }}>← Landing page</button>
+          <button className="btn btn-quiet" onClick={() => { setView("landing"); window.scrollTo({ top: 0, behavior: "smooth" }); }}>← Home page</button>
           <span className="local-badge"><span className="dot" /> Browser demo</span>
           <button className="btn btn-quiet" onClick={exportCsv}><ArrowDownToLine size={16} /> Export CSV</button>
         </div>
@@ -362,6 +416,7 @@ function App() {
                       <span className="avatar avatar-large">{client.name.split(/\s+/).slice(0, 2).map(w => w[0]).join("").toUpperCase()}</span>
                       <div><span className="section-kicker">CLIENT OVERVIEW</span><h2>{client.name}</h2><p>{client.email || "No email added"} <span className="separator">·</span> {client.period}</p></div>
                     </div>
+                    <button className="btn btn-quiet" onClick={editClientDetails}>Edit client</button>
                     <button className="icon-btn danger-icon" title="Delete client" aria-label="Delete client" onClick={deleteClient}><Trash2 size={17}/></button>
                   </div>
                   <div className="progress-head"><span>Document checklist</span><strong>{receivedCount} of {totalItems} received</strong></div>
@@ -393,13 +448,18 @@ function App() {
                 </section>
 
                 <section className="panel reminder-panel">
-                  <div className="panel-heading"><div><span className="section-kicker">READY-TO-SEND DRAFT</span><h2>Draft a follow-up</h2></div><span className="draft-tag"><Sparkles size={13}/> No AI required</span></div>
+                  <div className="panel-heading"><div><span className="section-kicker">READY-TO-SEND DRAFT</span><h2>AI Reminder Assistant</h2></div><span className="draft-tag"><Sparkles size={13}/> Demo drafting mode</span></div>
                   <div className="controls-row">
                     <label>Channel<select value={channel} onChange={e => setChannel(e.target.value)}><option>Email</option><option>WhatsApp</option></select></label>
-                    <label>Tone<select value={tone} onChange={e => setTone(e.target.value)}><option>Friendly</option><option>Direct</option></select></label>
+                    <label>Tone<select value={tone} onChange={e => setTone(e.target.value)}><option>Friendly and professional</option><option>Polite but firm</option><option>Short and direct</option><option>Custom instructions</option></select></label>
                   </div>
-                  <div className="message-preview"><div className="preview-label"><span className="preview-dot"/> MESSAGE PREVIEW</div><pre>{reminder}</pre></div>
-                  <div className="reminder-footer"><span>Review the draft before sending.</span><button className="btn btn-primary" onClick={copyReminder}>{copied ? <CheckCheck size={16}/> : <Copy size={16}/>} {copied ? "Copied!" : "Copy reminder"}</button></div>
+                  {tone === "Custom instructions" && <label className="assistant-field">Preferred style<textarea value={customTone} onChange={e => setCustomTone(e.target.value)} placeholder="e.g. Warm and concise" rows="2"/></label>}
+                  <label className="assistant-field">Additional writing instructions<textarea value={instructions} onChange={e => setInstructions(e.target.value)} rows="2"/></label>
+                  <div className="assistant-actions"><button className="btn btn-dark" onClick={generateDraft}><Sparkles size={15}/>{hasGeneratedDraft?"Regenerate draft":"Generate draft"}</button><span>Uses client and checklist details in this browser.</span></div>
+                  <div className="draft-status">{hasGeneratedDraft ? "Demo draft — review before sending" : "Demo drafting mode"}</div>
+                  <div className="message-preview"><div className="preview-label"><span className="preview-dot"/> EDITABLE MESSAGE DRAFT</div><textarea className="draft-editor" aria-label="Editable reminder message" value={activeDraft} onChange={e=>updateDraft(e.target.value)} placeholder="Generate a reminder draft or write your own message." rows="8"/></div>
+                  <p className="assistant-disclaimer">Demo templates may need adjustment. You are responsible for reviewing and approving the message before sending.</p>
+                  <div className="reminder-footer"><span>Review before sending.</span><div className="reminder-actions"><button className="btn btn-quiet" onClick={copyReminder}>{copied ? <CheckCheck size={16}/> : <Copy size={16}/>} {copied ? "Copied!" : "Copy message"}</button><button className="btn btn-primary" onClick={openWhatsApp}><Send size={15}/> Send via WhatsApp</button></div></div>
                 </section>
               </>
             )}
@@ -408,13 +468,14 @@ function App() {
         <footer className="footer"><span>ReceiptRelay <span className="footer-dot">·</span> Early MVP</span><span>Demo data is stored in this browser only.</span></footer>
       </main>
 
-      {showAddClient && <div className="modal-backdrop" role="presentation" onMouseDown={e => {if(e.target === e.currentTarget) setShowAddClient(false);}}>
+      {showAddClient && <div className="modal-backdrop" role="presentation" onMouseDown={e => {if(e.target === e.currentTarget) {setShowAddClient(false);setEditingClientId("");}}}>
         <form className="modal" onSubmit={addClient}>
-          <div className="modal-head"><div><span className="section-kicker">NEW RECORD</span><h2>Add a client</h2></div><button type="button" className="icon-btn" onClick={() => setShowAddClient(false)} aria-label="Close"><X size={18}/></button></div>
+          <div className="modal-head"><div><span className="section-kicker">{editingClientId?"UPDATE RECORD":"NEW RECORD"}</span><h2>{editingClientId?"Edit client":"Add a client"}</h2></div><button type="button" className="icon-btn" onClick={() => {setShowAddClient(false);setEditingClientId("");}} aria-label="Close"><X size={18}/></button></div>
           <label>Client or business name *<input autoFocus required value={newClient.name} onChange={e => setNewClient({...newClient, name: e.target.value})} placeholder="e.g. Acme Studio"/></label>
           <label>Contact email (optional)<input type="email" value={newClient.email} onChange={e => setNewClient({...newClient, email: e.target.value})} placeholder="accounts@company.com"/></label>
+          <label>WhatsApp phone number (optional)<input type="tel" value={newClient.phone} onChange={e => setNewClient({...newClient, phone: e.target.value})} placeholder="+1 555 123 4567"/><small>Include the country code for WhatsApp.</small></label>
           <div className="modal-grid"><label>Period<input value={newClient.period} onChange={e => setNewClient({...newClient, period: e.target.value})} placeholder="October 2026"/></label><label>Target date<input type="date" value={newClient.deadline} onChange={e => setNewClient({...newClient, deadline: e.target.value})}/></label></div>
-          <div className="modal-actions"><button type="button" className="btn btn-quiet" onClick={() => setShowAddClient(false)}>Cancel</button><button type="submit" className="btn btn-primary"><Plus size={16}/> Create client</button></div>
+          <div className="modal-actions"><button type="button" className="btn btn-quiet" onClick={() => {setShowAddClient(false);setEditingClientId("");}}>Cancel</button><button type="submit" className="btn btn-primary"><Plus size={16}/> {editingClientId?"Save changes":"Create client"}</button></div>
         </form>
       </div>}
       {notice && <div className="toast" role="status">{notice}<button onClick={() => setNotice("")} aria-label="Dismiss"><X size={14}/></button></div>}
